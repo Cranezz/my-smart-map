@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>US Property Map</title>
+
+  <!-- MapLibre GL JS — WebGL map rendering with vector tile support -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@5.3.0/dist/maplibre-gl.css" />
+  <script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5.3.0/dist/maplibre-gl.js"></script>
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- Full-screen map — MapLibre renders into this div -->
+  <div id="map"></div>
+
+  <!-- Top-left info panel -->
+  <div id="info-panel">
+    <h1>US Property Map</h1>
+    <div id="data-mode-badge" class="badge badge-demo">Demo Mode (SF parcels)</div>
+    <p id="zoom-hint">Zoom in to see property lines</p>
+  </div>
+
+  <!-- Hover popup — positioned by JS, hidden by default -->
+  <div id="popup" class="popup hidden">
+    <div id="popup-address" class="popup-address"></div>
+    <div id="popup-owner"></div>
+    <div id="popup-size"></div>
+  </div>
+
+  <!-- config.js must load before app.js so window.MAP_CONFIG is defined -->
+  <!-- If config.js is missing (GitHub Pages), app falls back to demo mode -->
+  <script>
+    // Default config — overridden if config.js is present
+    window.MAP_CONFIG = {
+      REGRID_TOKEN: '',
+      DEFAULT_CENTER: [-98.5795, 39.8283],
+      DEFAULT_ZOOM: 4,
+      PARCEL_MIN_ZOOM: 14,
+    };
+  </script>
+  <script src="config.js" onerror="console.log('No config.js found — using demo mode.')"></script>
+  <script src="app.js"></script>
+
+</body>
+</html>

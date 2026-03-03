@@ -1,0 +1,10 @@
+# API keys — copy config.example.js to config.js and fill in your token.
+# config.js is intentionally excluded from git so your Regrid token
+# never appears in the public repository.
+config.js
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
