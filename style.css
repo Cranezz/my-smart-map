@@ -100,6 +100,12 @@ body,
   margin-bottom: 4px;
 }
 
+.popup-value {
+  color: #90EE90;  /* light green — money color */
+  font-weight: 600;
+  font-size: 12px;
+}
+
 /* ============================================================
    Loading indicator — bottom center, shown during API fetches
    ============================================================ */
@@ -168,6 +174,37 @@ body,
 .legend-label {
   color: #d0d0d0;
   font-size: 11px;
+}
+
+.legend-title-2nd {
+  margin-top: 10px;
+  border-top: 1px solid rgba(255,255,255,0.1);
+  padding-top: 8px;
+}
+
+/* Price gradient bar */
+.legend-gradient-wrap {
+  margin-bottom: 8px;
+}
+
+.legend-gradient-bar {
+  height: 10px;
+  border-radius: 5px;
+  background: linear-gradient(to right,
+    rgba(34,  197,  94, 0.85),
+    rgba(220, 220, 30,  0.85),
+    rgba(255, 165, 0,   0.85),
+    rgba(230, 40,  40,  0.85),
+    rgba(139, 0,   0,   0.90)
+  );
+  margin-bottom: 4px;
+}
+
+.legend-gradient-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  color: rgba(200, 200, 200, 0.8);
 }
 
 .legend-note {

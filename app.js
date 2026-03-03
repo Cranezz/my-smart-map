@@ -22,11 +22,12 @@ const USE_REGRID    = REGRID_TOKEN.length  > 0;
 // Idaho as the default view
 const DEFAULT_CENTER    = CONFIG.DEFAULT_CENTER    || [-114.7420, 44.0682];
 const DEFAULT_ZOOM      = CONFIG.DEFAULT_ZOOM      || 6.5;
-const PARCEL_MIN_ZOOM   = CONFIG.PARCEL_MIN_ZOOM   || 14;
+const PARCEL_MIN_ZOOM   = CONFIG.PARCEL_MIN_ZOOM   || 11;  // show lines earlier
 const BUILDING_MIN_ZOOM = 15;  // OSM buildings appear at street level
 
 // Source / layer IDs
 const SOURCE_ID          = 'parcels';
+const PRICE_FILL_ID      = 'price-fills';   // value gradient fill (new)
 const FILL_LAYER_ID      = 'parcel-fills';
 const OUTLINE_LAYER_ID   = 'parcel-outlines';
 const BUILDING_SOURCE_ID = 'osm-buildings';
@@ -77,10 +78,11 @@ function addLayers() {
   // -- Raster base --
   addSatelliteLayer();
 
-  // -- Vector data (buildings → parcels → state lines) --
+  // -- Vector data (buildings → price gradient → hover fill → outlines → state) --
   addBuildingLayers();
   addParcelSource();
-  addParcelFillLayer();
+  addPriceFillLayer();    // NEW: red/green gradient by assessed value
+  addParcelFillLayer();   // hover gold (sits above price fill)
   addParcelOutlineLayer();
   addStateLinesLayer();
 
@@ -168,7 +170,69 @@ function addParcelSource() {
   }
 }
 
-// 3d — Parcel fill (transparent → gold on hover)
+// 3d — Price gradient fill — semi-transparent red/green overlay per parcel.
+//      Uses assessed land+improvement value (Regrid) or sale price on a log10
+//      scale so the gradient is meaningful across a wide range of property values.
+//      Falls back to near-transparent grey when no value data is available (IDWR).
+function addPriceFillLayer() {
+  const def = {
+    id: PRICE_FILL_ID,
+    type: 'fill',
+    source: SOURCE_ID,
+    minzoom: PARCEL_MIN_ZOOM,
+    paint: {
+      'fill-color':   priceColorExpr(),
+      'fill-opacity': 1,  // opacity is baked into the rgba() colors in the expression
+    },
+  };
+  if (USE_REGRID) def['source-layer'] = REGRID_SOURCE_LAYER;
+  map.addLayer(def);
+}
+
+/**
+ * MapLibre expression: maps assessed property value → rgba color.
+ *
+ * Scale (log10):
+ *   0   = $1      → near-transparent grey  (no data)
+ *   3   = $1 K    → green
+ *   4   = $10 K   → yellow-green
+ *   4.7 = $50 K   → yellow
+ *   5.2 = $150 K  → orange
+ *   5.7 = $500 K  → red-orange
+ *   6+  = $1 M+   → deep red
+ *
+ * Regrid value fields used (in priority order):
+ *   saleprice  → most recent recorded sale price
+ *   landval + improvval → county-assessed total value
+ */
+function priceColorExpr() {
+  // Total value: prefer sale price, fall back to assessed land + improvement
+  const totalValue = [
+    'coalesce',
+    ['get', 'saleprice'],
+    ['+',
+      ['coalesce', ['get', 'landval'],   0],
+      ['coalesce', ['get', 'improvval'], 0],
+    ],
+    0,
+  ];
+
+  // log10 of max(1, value) so log is always ≥ 0
+  const logVal = ['log10', ['max', 1, totalValue]];
+
+  return ['interpolate', ['linear'], logVal,
+    0,    'rgba(160, 160, 160, 0.07)',  // no data — nearly invisible grey
+    2.5,  'rgba(34,  197,  94, 0.42)',  // ~$300     — green
+    3.5,  'rgba(101, 220, 50,  0.44)',  // ~$3 K     — bright green
+    4.3,  'rgba(220, 220, 30,  0.46)',  // ~$20 K    — yellow
+    4.7,  'rgba(255, 165, 0,   0.48)',  // ~$50 K    — orange
+    5.2,  'rgba(255, 90,  30,  0.50)',  // ~$160 K   — red-orange
+    5.7,  'rgba(230, 40,  40,  0.52)',  // ~$500 K   — red
+    6.5,  'rgba(139, 0,   0,   0.55)',  // ~$3 M+    — deep red
+  ];
+}
+
+// 3e — Parcel fill (transparent → gold on hover)
 function addParcelFillLayer() {
   const def = {
     id: FILL_LAYER_ID,
@@ -442,7 +506,7 @@ async function loadIdahoParcels() {
     geometryType:     'esriGeometryEnvelope',
     spatialRel:       'esriSpatialRelIntersects',
     outFields:        'OBJECTID,PIN,COUNTY,OWNER,Shape__Area',
-    resultRecordCount: 500,
+    resultRecordCount: 2000,  // IDWR max — more coverage when zoomed out
     f:                'geojson',
     outSR:            '4326',
   });
@@ -638,16 +702,39 @@ function showPopup(point, props) {
     }
   }
 
+  // ---- Property Value (Regrid fields) ----
+  const salePrice  = parseFloat(props.saleprice)  || 0;
+  const landVal    = parseFloat(props.landval)     || 0;
+  const improvVal  = parseFloat(props.improvval)   || 0;
+  const totalAssessed = landVal + improvVal;
+
+  let valueText = null;
+  if (salePrice > 0) {
+    valueText = `Sale: ${formatUSD(salePrice)}`;
+  } else if (totalAssessed > 0) {
+    valueText = `Assessed: ${formatUSD(totalAssessed)}`;
+    if (landVal > 0 && improvVal > 0) {
+      valueText += ` (land ${formatUSD(landVal)} + improvements ${formatUSD(improvVal)})`;
+    }
+  }
+
   // ---- County (IDWR specific) ----
   const county = props.COUNTY ? `${props.COUNTY} County, ID` : null;
 
   popupAddress.textContent = address;
   popupOwner.textContent   = owner ? `Owner: ${owner}` : '';
 
-  if (sizeText) {
-    popupSize.textContent = `Size: ${sizeText}${county ? ` · ${county}` : ''}`;
-  } else if (county) {
-    popupSize.textContent = county;
+  // Build size + value line
+  const meta = [];
+  if (sizeText)  meta.push(`${sizeText}`);
+  if (county)    meta.push(county);
+  if (valueText) {
+    // Value gets its own line via the existing popup-size element color
+    popupSize.innerHTML =
+      (meta.length ? `<span>${meta.join(' · ')}</span><br>` : '') +
+      `<span class="popup-value">${valueText}</span>`;
+  } else if (meta.length) {
+    popupSize.textContent = meta.join(' · ');
   } else {
     // SF demo fallback: show neighborhood + zoning
     const nb   = props.analysis_neighborhood || null;
@@ -671,6 +758,13 @@ function showPopup(point, props) {
 
 function hidePopup() {
   popupEl.classList.add('hidden');
+}
+
+/** Format a number as a compact USD string: $1.2M, $340K, $85,000 */
+function formatUSD(n) {
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 10_000)    return `$${Math.round(n / 1_000)}K`;
+  return `$${n.toLocaleString('en-US')}`;
 }
 
 function buildAddressFromParts(props) {
@@ -729,7 +823,17 @@ function buildLegend() {
     { color: '#E8A44A', label: 'Building footprint (OSM)' },
   ];
 
-  legend.innerHTML = '<div class="legend-title">Property Type</div>' +
+  legend.innerHTML =
+    // --- Price gradient bar ---
+    '<div class="legend-title">Property Value</div>' +
+    '<div class="legend-gradient-wrap">' +
+      '<div class="legend-gradient-bar"></div>' +
+      '<div class="legend-gradient-labels">' +
+        '<span>Cheap</span><span>$50K</span><span>$500K</span><span>Expensive</span>' +
+      '</div>' +
+    '</div>' +
+    // --- Land-use outline colors ---
+    '<div class="legend-title legend-title-2nd">Property Type (outline)</div>' +
     entries.map(e =>
       `<div class="legend-row">` +
       `<span class="legend-swatch" style="background:${e.color}"></span>` +
@@ -739,8 +843,8 @@ function buildLegend() {
 
   if (!USE_REGRID) {
     legend.innerHTML +=
-      '<div class="legend-note">Color coding requires Regrid API token. ' +
-      'Idaho parcels shown in grey (IDWR has no land-use field).</div>';
+      '<div class="legend-note">Value gradient &amp; type colors require Regrid token. ' +
+      'Idaho (IDWR) parcels have no value or land-use fields.</div>';
   }
 }
 
