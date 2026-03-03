@@ -30,14 +30,20 @@
     <div id="popup-size"></div>
   </div>
 
+  <!-- Loading indicator — shown while fetching IDWR parcels or OSM buildings -->
+  <div id="loading-indicator" class="loading-indicator hidden"></div>
+
+  <!-- Land-use color legend — bottom right -->
+  <div id="legend" class="legend"></div>
+
   <!-- config.js must load before app.js so window.MAP_CONFIG is defined -->
   <!-- If config.js is missing (GitHub Pages), app falls back to demo mode -->
   <script>
     // Default config — overridden if config.js is present
     window.MAP_CONFIG = {
       REGRID_TOKEN: '',
-      DEFAULT_CENTER: [-98.5795, 39.8283],
-      DEFAULT_ZOOM: 4,
+      DEFAULT_CENTER: [-114.7420, 44.0682],  // Center of Idaho
+      DEFAULT_ZOOM: 6.5,
       PARCEL_MIN_ZOOM: 14,
     };
   </script>

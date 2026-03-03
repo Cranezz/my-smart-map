@@ -101,6 +101,85 @@ body,
 }
 
 /* ============================================================
+   Loading indicator — bottom center, shown during API fetches
+   ============================================================ */
+.loading-indicator {
+  position: absolute;
+  bottom: 36px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  background: rgba(8, 8, 20, 0.82);
+  color: #ffd700;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 14px;
+  border-radius: 20px;
+  border: 1px solid rgba(255, 215, 0, 0.3);
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+}
+
+.loading-indicator.hidden {
+  display: none;
+}
+
+/* ============================================================
+   Land-use legend — bottom right
+   ============================================================ */
+.legend {
+  position: absolute;
+  bottom: 36px;
+  right: 10px;
+  z-index: 10;
+  background: rgba(8, 8, 18, 0.82);
+  color: #e0e0e0;
+  padding: 10px 13px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  font-size: 11px;
+  min-width: 180px;
+  backdrop-filter: blur(4px);
+}
+
+.legend-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #ffffff;
+  margin-bottom: 7px;
+  letter-spacing: 0.3px;
+}
+
+.legend-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 5px;
+}
+
+.legend-swatch {
+  display: inline-block;
+  width: 22px;
+  height: 3px;
+  border-radius: 2px;
+  margin-right: 8px;
+  flex-shrink: 0;
+}
+
+.legend-label {
+  color: #d0d0d0;
+  font-size: 11px;
+}
+
+.legend-note {
+  margin-top: 8px;
+  font-size: 10px;
+  color: rgba(255, 200, 80, 0.7);
+  border-top: 1px solid rgba(255,255,255,0.1);
+  padding-top: 6px;
+  line-height: 1.5;
+}
+
+/* ============================================================
    MapLibre attribution — ensure it's readable over satellite
    ============================================================ */
 .maplibregl-ctrl-attrib {

@@ -1,30 +1,48 @@
 // =============================================================================
-// US Property Map — app.js
+// US Property Map — app.js  (v2)
 // =============================================================================
-// Reads window.MAP_CONFIG (set in index.html inline script, optionally
-// overridden by config.js). Falls back gracefully to demo GeoJSON mode
-// when no Regrid API token is configured.
+// Layer stack (bottom → top):
+//   1. ESRI Satellite
+//   2. OSM Building footprints  (every house, zoom 15+)
+//   3. Idaho/Regrid Parcel fills  (hover gold)
+//   4. Parcel outlines  (grey → white on hover)
+//   5. US State boundary lines
+//   6. ESRI Transportation overlay  (roads + road names)
+//   7. ESRI Boundaries & Places overlay  (city names, state names)
 // =============================================================================
 
 // ---------------------------------------------------------------------------
 // 1. Config & constants
 // ---------------------------------------------------------------------------
 
-const CONFIG = window.MAP_CONFIG || {};
-const REGRID_TOKEN = CONFIG.REGRID_TOKEN || '';
-const USE_REGRID = REGRID_TOKEN.length > 0;
+const CONFIG        = window.MAP_CONFIG || {};
+const REGRID_TOKEN  = CONFIG.REGRID_TOKEN  || '';
+const USE_REGRID    = REGRID_TOKEN.length  > 0;
 
-const DEFAULT_CENTER = CONFIG.DEFAULT_CENTER || [-98.5795, 39.8283];
-const DEFAULT_ZOOM   = CONFIG.DEFAULT_ZOOM   || 4;
-const PARCEL_MIN_ZOOM = CONFIG.PARCEL_MIN_ZOOM || 14;
+// Idaho as the default view
+const DEFAULT_CENTER    = CONFIG.DEFAULT_CENTER    || [-114.7420, 44.0682];
+const DEFAULT_ZOOM      = CONFIG.DEFAULT_ZOOM      || 6.5;
+const PARCEL_MIN_ZOOM   = CONFIG.PARCEL_MIN_ZOOM   || 14;
+const BUILDING_MIN_ZOOM = 15;  // OSM buildings appear at street level
 
-// Layer/source IDs — defined once to avoid string typos
-const SOURCE_ID       = 'parcels';
-const FILL_LAYER_ID   = 'parcel-fills';
-const OUTLINE_LAYER_ID = 'parcel-outlines';
-
-// For Regrid MVT tiles the data lives in this source-layer inside each tile
+// Source / layer IDs
+const SOURCE_ID          = 'parcels';
+const FILL_LAYER_ID      = 'parcel-fills';
+const OUTLINE_LAYER_ID   = 'parcel-outlines';
+const BUILDING_SOURCE_ID = 'osm-buildings';
+const BUILDING_FILL_ID   = 'buildings-fill';
+const BUILDING_LINE_ID   = 'buildings-outline';
 const REGRID_SOURCE_LAYER = 'parcels';
+
+// Idaho bounding box — used to guard IDWR demo queries
+const IDAHO_BOUNDS = { west: -117.24, east: -111.04, south: 41.99, north: 49.00 };
+
+// IDWR statewide Idaho parcel API (free, no key required)
+const IDWR_URL =
+  'https://gis.idwr.idaho.gov/hosting/rest/services/Reference/Parcels/FeatureServer/0/query';
+
+// OpenStreetMap Overpass API for building footprints
+const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
 
 // ---------------------------------------------------------------------------
 // 2. Map initialisation
@@ -32,12 +50,11 @@ const REGRID_SOURCE_LAYER = 'parcels';
 
 const map = new maplibregl.Map({
   container: 'map',
-  // Minimal blank style — we add our own sources rather than using a hosted
-  // style URL, keeping the app self-contained and free
   style: {
     version: 8,
     sources: {},
     layers: [],
+    // Glyph font for state/label text rendering
     glyphs: 'https://fonts.openmaptiles.org/{fontstack}/{range}.pbf',
   },
   center: DEFAULT_CENTER,
@@ -46,33 +63,42 @@ const map = new maplibregl.Map({
   maxZoom: 21,
 });
 
-// Navigation controls (zoom +/- and compass)
 map.addControl(new maplibregl.NavigationControl(), 'top-right');
-
-// Show scale bar
 map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: 'imperial' }), 'bottom-left');
 
-// Once the map style is loaded, add all layers
 map.on('load', addLayers);
-
-// Update the zoom hint text as the user zooms in/out
 map.on('zoom', updateZoomHint);
 
 // ---------------------------------------------------------------------------
-// 3. Layer setup
+// 3. Layer setup — order here defines visual stack
 // ---------------------------------------------------------------------------
 
 function addLayers() {
+  // -- Raster base --
   addSatelliteLayer();
+
+  // -- Vector data (buildings → parcels → state lines) --
+  addBuildingLayers();
   addParcelSource();
   addParcelFillLayer();
   addParcelOutlineLayer();
+  addStateLinesLayer();
+
+  // -- Raster reference overlays (roads + labels sit on top of everything) --
+  addTransportationOverlay();
+  addLabelsOverlay();
+
+  // -- Interactivity --
   setupHoverHandlers();
+  setupDynamicLoading();
+
+  // -- UI --
   updateDataModeBadge();
   updateZoomHint();
+  buildLegend();
 }
 
-// 3a — ESRI World Imagery satellite raster (free, no API key required)
+// 3a — ESRI World Imagery satellite base
 function addSatelliteLayer() {
   map.addSource('esri-satellite', {
     type: 'raster',
@@ -84,21 +110,45 @@ function addSatelliteLayer() {
       'Imagery &copy; Esri, Maxar, GeoEye, Earthstar Geographics, ' +
       'CNES/Airbus DS, USDA, USGS, AeroGRID, IGN',
   });
+  map.addLayer({ id: 'satellite', type: 'raster', source: 'esri-satellite' });
+}
+
+// 3b — OSM building footprint layers (every house, loaded dynamically)
+function addBuildingLayers() {
+  // Empty collection — gets populated by loadBuildings() as user pans
+  map.addSource(BUILDING_SOURCE_ID, {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] },
+  });
+
+  // Subtle orange/amber fill so buildings are visible on satellite
+  map.addLayer({
+    id: BUILDING_FILL_ID,
+    type: 'fill',
+    source: BUILDING_SOURCE_ID,
+    minzoom: BUILDING_MIN_ZOOM,
+    paint: {
+      'fill-color': '#E8A44A',
+      'fill-opacity': 0.25,
+    },
+  });
 
   map.addLayer({
-    id: 'satellite',
-    type: 'raster',
-    source: 'esri-satellite',
-    paint: { 'raster-opacity': 1 },
+    id: BUILDING_LINE_ID,
+    type: 'line',
+    source: BUILDING_SOURCE_ID,
+    minzoom: BUILDING_MIN_ZOOM,
+    paint: {
+      'line-color': '#E8A44A',
+      'line-width': 0.7,
+      'line-opacity': 0.7,
+    },
   });
 }
 
-// 3b — Parcel data source: Regrid MVT tiles OR bundled demo GeoJSON
+// 3c — Parcel source: Regrid MVT tiles (nationwide) OR IDWR dynamic GeoJSON (Idaho)
 function addParcelSource() {
   if (USE_REGRID) {
-    // Nationwide US parcel data via Regrid MVT vector tiles.
-    // Token is passed as a URL query parameter (documented Regrid method).
-    // Tiles only load at zoom 14+ — this guards the free-tier quota.
     map.addSource(SOURCE_ID, {
       type: 'vector',
       tiles: [
@@ -106,126 +156,423 @@ function addParcelSource() {
       ],
       minzoom: PARCEL_MIN_ZOOM,
       maxzoom: 20,
-      attribution: 'Parcel data &copy; <a href="https://regrid.com" target="_blank">Regrid</a>',
+      attribution: 'Parcels &copy; <a href="https://regrid.com" target="_blank">Regrid</a>',
     });
   } else {
-    // Demo mode: pre-clipped GeoJSON for a San Francisco neighborhood.
-    // generateId: true assigns an integer id to each feature, which is
-    // required for setFeatureState to work on GeoJSON sources.
+    // Demo: empty GeoJSON source, populated dynamically by loadIdahoParcels()
     map.addSource(SOURCE_ID, {
       type: 'geojson',
-      data: './data/demo-parcels.geojson',
+      data: { type: 'FeatureCollection', features: [] },
       generateId: true,
     });
   }
 }
 
-// 3c — Transparent fill polygon layer.
-// Becomes gold (semi-transparent) on hover via GPU feature-state — no JS
-// style updates needed per frame, just a state flag change.
+// 3d — Parcel fill (transparent → gold on hover)
 function addParcelFillLayer() {
-  const layerDef = {
+  const def = {
     id: FILL_LAYER_ID,
     type: 'fill',
     source: SOURCE_ID,
     minzoom: PARCEL_MIN_ZOOM,
     paint: {
       'fill-color': [
-        'case',
-        ['boolean', ['feature-state', 'hover'], false],
-        '#FFD700',          // gold highlight on hover
-        'rgba(0,0,0,0)',    // fully transparent at rest
+        'case', ['boolean', ['feature-state', 'hover'], false],
+        '#FFD700', 'rgba(0,0,0,0)',
       ],
       'fill-opacity': [
-        'case',
-        ['boolean', ['feature-state', 'hover'], false],
-        0.35,  // semi-transparent on hover
-        0,     // invisible at rest (outlines still show)
+        'case', ['boolean', ['feature-state', 'hover'], false],
+        0.35, 0,
       ],
     },
   };
-
-  // Vector tiles require a source-layer to identify which data layer
-  // inside the MVT tile to read from
-  if (USE_REGRID) {
-    layerDef['source-layer'] = REGRID_SOURCE_LAYER;
-  }
-
-  map.addLayer(layerDef);
+  if (USE_REGRID) def['source-layer'] = REGRID_SOURCE_LAYER;
+  map.addLayer(def);
 }
 
-// 3d — Grey outline layer. Also brightens on hover via feature-state.
+// 3e — Parcel outline — color-coded by land use type when Regrid provides the
+//      usedesc field; falls back to grey when no land use data is available (IDWR).
+//      Brightens to white on hover regardless of land use color.
 function addParcelOutlineLayer() {
-  const layerDef = {
+  const def = {
     id: OUTLINE_LAYER_ID,
     type: 'line',
     source: SOURCE_ID,
     minzoom: PARCEL_MIN_ZOOM,
     paint: {
-      'line-color': [
-        'case',
-        ['boolean', ['feature-state', 'hover'], false],
-        '#FFFFFF',    // bright white on hover
-        '#AAAAAA',    // grey at rest
-      ],
+      'line-color': landUseColorExpr(),
       'line-width': [
-        'case',
-        ['boolean', ['feature-state', 'hover'], false],
-        2,    // thicker on hover
-        0.8,  // thin at rest
+        'case', ['boolean', ['feature-state', 'hover'], false],
+        2.5, 1,
       ],
-      'line-opacity': 0.85,
+      'line-opacity': [
+        'case', ['boolean', ['feature-state', 'hover'], false],
+        1, 0.8,
+      ],
     },
   };
+  if (USE_REGRID) def['source-layer'] = REGRID_SOURCE_LAYER;
+  map.addLayer(def);
+}
 
-  if (USE_REGRID) {
-    layerDef['source-layer'] = REGRID_SOURCE_LAYER;
+/**
+ * Returns a MapLibre expression that maps land-use description strings
+ * to colors. Works on Regrid's `usedesc` field. Falls back to grey
+ * when the field is absent (IDWR demo data has no land-use field).
+ *
+ * Color key:
+ *   Blue    (#4A9EFF) — Residential
+ *   Gold    (#FFD700) — Commercial
+ *   Red     (#FF6B6B) — Industrial
+ *   Green   (#4CAF50) — Agricultural / Rural / Timber
+ *   Cyan    (#26C6DA) — Public / Government / Exempt
+ *   Grey    (#888888) — Vacant / Undeveloped
+ *   Lt grey (#AAAAAA) — Unknown / No data
+ */
+function landUseColorExpr() {
+  // desc evaluates to a lowercase string; we repeat it in each branch.
+  // MapLibre's `in` operator: ['in', substring, string_expr] → boolean
+  function d() {
+    return ['downcase', ['coalesce', ['get', 'usedesc'], ['get', 'USEDESC'], '']];
   }
 
-  map.addLayer(layerDef);
+  return [
+    'case',
+    // Hover always wins → white
+    ['boolean', ['feature-state', 'hover'], false], '#FFFFFF',
+
+    // --- Residential (blue) ---
+    ['any',
+      ['in', 'residential',  d()],
+      ['in', 'single family', d()],
+      ['in', 'single-family', d()],
+      ['in', 'duplex',        d()],
+      ['in', 'triplex',       d()],
+      ['in', 'condo',         d()],
+      ['in', 'townhouse',     d()],
+      ['in', 'mobile home',   d()],
+      ['in', 'multi family',  d()],
+      ['in', 'apartment',     d()],
+    ], '#4A9EFF',
+
+    // --- Commercial (gold) ---
+    ['any',
+      ['in', 'commercial', d()],
+      ['in', 'retail',     d()],
+      ['in', 'office',     d()],
+      ['in', 'hotel',      d()],
+      ['in', 'motel',      d()],
+      ['in', 'shopping',   d()],
+      ['in', 'restaurant', d()],
+    ], '#FFD700',
+
+    // --- Industrial (red) ---
+    ['any',
+      ['in', 'industrial',     d()],
+      ['in', 'warehouse',      d()],
+      ['in', 'manufacturing',  d()],
+      ['in', 'quarry',         d()],
+      ['in', 'mining',         d()],
+      ['in', 'utility',        d()],
+    ], '#FF6B6B',
+
+    // --- Agricultural / Rural / Timber (green) ---
+    ['any',
+      ['in', 'agricultural', d()],
+      ['in', 'agriculture',  d()],
+      ['in', 'farm',         d()],
+      ['in', 'ranch',        d()],
+      ['in', 'rural',        d()],
+      ['in', 'cropland',     d()],
+      ['in', 'pasture',      d()],
+      ['in', 'timber',       d()],
+      ['in', 'forest',       d()],
+      ['in', 'grazing',      d()],
+      ['in', 'orchard',      d()],
+    ], '#4CAF50',
+
+    // --- Public / Government / Exempt (cyan) ---
+    ['any',
+      ['in', 'government', d()],
+      ['in', 'public',     d()],
+      ['in', 'exempt',     d()],
+      ['in', 'park',       d()],
+      ['in', 'school',     d()],
+      ['in', 'church',     d()],
+      ['in', 'cemetery',   d()],
+      ['in', 'hospital',   d()],
+    ], '#26C6DA',
+
+    // --- Vacant / Undeveloped (medium grey) ---
+    ['any',
+      ['in', 'vacant',       d()],
+      ['in', 'undeveloped',  d()],
+    ], '#888888',
+
+    // --- Default: no land-use data or unrecognized type ---
+    '#AAAAAA',
+  ];
+}
+
+// 3f — US State boundary lines (GeoJSON from CDN)
+function addStateLinesLayer() {
+  map.addSource('us-states', {
+    type: 'geojson',
+    data: 'https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json',
+  });
+
+  // State border lines — bright orange so they stand out on satellite
+  map.addLayer({
+    id: 'state-lines',
+    type: 'line',
+    source: 'us-states',
+    paint: {
+      'line-color': '#FF7A00',
+      'line-width': ['interpolate', ['linear'], ['zoom'], 3, 1.5, 8, 2.5],
+      'line-opacity': 0.9,
+    },
+  });
+
+  // State name text labels from the GeoJSON 'name' property
+  map.addLayer({
+    id: 'state-name-labels',
+    type: 'symbol',
+    source: 'us-states',
+    maxzoom: 7,   // hide once zoomed in — ESRI overlay takes over
+    layout: {
+      'text-field': ['get', 'name'],
+      'text-font': ['Open Sans Bold'],
+      'text-size': ['interpolate', ['linear'], ['zoom'], 3, 9, 6, 14],
+      'text-transform': 'uppercase',
+      'text-letter-spacing': 0.12,
+    },
+    paint: {
+      'text-color': '#FFFFFF',
+      'text-halo-color': 'rgba(0,0,0,0.75)',
+      'text-halo-width': 1.8,
+    },
+  });
+}
+
+// 3g — ESRI World Transportation raster overlay (roads + road names)
+function addTransportationOverlay() {
+  map.addSource('esri-transportation', {
+    type: 'raster',
+    tiles: [
+      'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}'
+    ],
+    tileSize: 256,
+    attribution: 'Roads &copy; Esri',
+  });
+  map.addLayer({
+    id: 'transportation',
+    type: 'raster',
+    source: 'esri-transportation',
+    paint: { 'raster-opacity': 0.9 },
+  });
+}
+
+// 3h — ESRI World Boundaries & Places raster overlay
+//      (city names, state names, country names — sits on top of everything)
+function addLabelsOverlay() {
+  map.addSource('esri-labels', {
+    type: 'raster',
+    tiles: [
+      'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}'
+    ],
+    tileSize: 256,
+    attribution: 'Labels &copy; Esri',
+  });
+  map.addLayer({
+    id: 'reference-labels',
+    type: 'raster',
+    source: 'esri-labels',
+    paint: { 'raster-opacity': 1 },
+  });
 }
 
 // ---------------------------------------------------------------------------
-// 4. Hover interaction
+// 4. Dynamic data loading — fires on map move/zoom
 // ---------------------------------------------------------------------------
 
-// Track the currently-hovered feature ID so we can clear its state when
-// the mouse moves to a different parcel
+function debounce(fn, ms) {
+  let timer;
+  return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), ms); };
+}
+
+function setupDynamicLoading() {
+  const onMove = debounce(() => {
+    loadIdahoParcels();
+    loadBuildings();
+  }, 600);
+
+  map.on('moveend', onMove);
+  // Trigger once immediately for the initial view
+  setTimeout(onMove, 300);
+}
+
+// 4a — Load Idaho parcel boundaries from IDWR for the current viewport
+//      Only runs in demo mode (Regrid handles its own tiles)
+async function loadIdahoParcels() {
+  if (USE_REGRID) return;
+  const zoom = map.getZoom();
+  if (zoom < PARCEL_MIN_ZOOM) return;
+
+  const b = map.getBounds();
+
+  // Skip if the viewport doesn't overlap with Idaho at all
+  if (b.getEast()  < IDAHO_BOUNDS.west ||
+      b.getWest()  > IDAHO_BOUNDS.east ||
+      b.getNorth() < IDAHO_BOUNDS.south ||
+      b.getSouth() > IDAHO_BOUNDS.north) {
+    return;
+  }
+
+  // Clamp query envelope to Idaho so we don't request outside data
+  const env = {
+    xmin: Math.max(b.getWest(),  IDAHO_BOUNDS.west),
+    ymin: Math.max(b.getSouth(), IDAHO_BOUNDS.south),
+    xmax: Math.min(b.getEast(),  IDAHO_BOUNDS.east),
+    ymax: Math.min(b.getNorth(), IDAHO_BOUNDS.north),
+    spatialReference: { wkid: 4326 },
+  };
+
+  const params = new URLSearchParams({
+    geometry:         JSON.stringify(env),
+    geometryType:     'esriGeometryEnvelope',
+    spatialRel:       'esriSpatialRelIntersects',
+    outFields:        'OBJECTID,PIN,COUNTY,OWNER,Shape__Area',
+    resultRecordCount: 500,
+    f:                'geojson',
+    outSR:            '4326',
+  });
+
+  try {
+    setLoadingState(true, 'Loading Idaho parcels…');
+    const res = await fetch(`${IDWR_URL}?${params}`);
+    if (!res.ok) throw new Error(`IDWR ${res.status}`);
+    const geojson = await res.json();
+    const src = map.getSource(SOURCE_ID);
+    if (src && geojson.features) src.setData(geojson);
+  } catch (err) {
+    console.warn('IDWR parcel load failed:', err);
+  } finally {
+    setLoadingState(false);
+  }
+}
+
+// 4b — Load OSM building footprints via Overpass API for current viewport
+//      Shows every individual house/building shape
+async function loadBuildings() {
+  const zoom = map.getZoom();
+  if (zoom < BUILDING_MIN_ZOOM) {
+    // Clear buildings when zoomed out to avoid stale data
+    const src = map.getSource(BUILDING_SOURCE_ID);
+    if (src) src.setData({ type: 'FeatureCollection', features: [] });
+    return;
+  }
+
+  const b = map.getBounds();
+  // Clamp area to avoid querying huge regions (Overpass has a timeout)
+  const bbox = [
+    Math.max(b.getSouth(), b.getNorth() - 0.08).toFixed(5),
+    Math.max(b.getWest(),  b.getEast()  - 0.12).toFixed(5),
+    Math.min(b.getNorth(), b.getSouth() + 0.08).toFixed(5),
+    Math.min(b.getEast(),  b.getWest()  + 0.12).toFixed(5),
+  ].join(',');
+
+  // Overpass QL: residential buildings + all buildings in viewport
+  const query =
+    `[out:json][timeout:20][bbox:${bbox}];` +
+    `(way["building"];);` +
+    `out geom;`;
+
+  try {
+    setLoadingState(true, 'Loading buildings…');
+    const res = await fetch(OVERPASS_URL, {
+      method: 'POST',
+      body: `data=${encodeURIComponent(query)}`,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+    if (!res.ok) throw new Error(`Overpass ${res.status}`);
+    const data = await res.json();
+    const geojson = overpassToGeoJSON(data);
+    const src = map.getSource(BUILDING_SOURCE_ID);
+    if (src) src.setData(geojson);
+  } catch (err) {
+    console.warn('Building load failed:', err);
+  } finally {
+    setLoadingState(false);
+  }
+}
+
+// 4c — Convert Overpass JSON → GeoJSON FeatureCollection
+function overpassToGeoJSON(data) {
+  return {
+    type: 'FeatureCollection',
+    features: (data.elements || [])
+      .filter(el =>
+        el.type === 'way' &&
+        Array.isArray(el.geometry) &&
+        el.geometry.length >= 3
+      )
+      .map(el => ({
+        type: 'Feature',
+        id: el.id,
+        geometry: {
+          type: 'Polygon',
+          // OSM geometry uses lat/lon; GeoJSON needs [lon, lat]
+          coordinates: [el.geometry.map(pt => [pt.lon, pt.lat])],
+        },
+        properties: {
+          osm_id:    el.id,
+          building:  (el.tags && el.tags.building)  || 'yes',
+          name:      (el.tags && el.tags.name)       || null,
+          addr:      formatOsmAddr(el.tags),
+          levels:    (el.tags && el.tags['building:levels']) || null,
+        },
+      })),
+  };
+}
+
+function formatOsmAddr(tags) {
+  if (!tags) return null;
+  const parts = [
+    tags['addr:housenumber'],
+    tags['addr:street'],
+    tags['addr:city'],
+  ].filter(Boolean);
+  return parts.length > 1 ? parts.join(' ') : null;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Hover interaction (parcels only — buildings are visual reference only)
+// ---------------------------------------------------------------------------
+
 let hoveredFeatureId = null;
 
 function featureStateRef(id) {
-  // Builds the correct object for setFeatureState / removeFeatureState.
-  // Regrid vector tiles need sourceLayer; GeoJSON sources do not.
   const ref = { source: SOURCE_ID, id };
   if (USE_REGRID) ref.sourceLayer = REGRID_SOURCE_LAYER;
   return ref;
 }
 
 function setupHoverHandlers() {
-  // mousemove on the fill layer — triggers even when outline is topmost
-  // because the fill covers the full polygon area
   map.on('mousemove', FILL_LAYER_ID, (e) => {
     if (!e.features || e.features.length === 0) return;
 
     const feature = e.features[0];
 
-    // Clear previous hover state
     if (hoveredFeatureId !== null) {
       map.setFeatureState(featureStateRef(hoveredFeatureId), { hover: false });
     }
-
-    // Set new hover state
     hoveredFeatureId = feature.id;
     map.setFeatureState(featureStateRef(hoveredFeatureId), { hover: true });
 
-    // Show the info popup near the cursor
     showPopup(e.point, feature.properties);
-
-    // Pointer cursor signals the layer is interactive
     map.getCanvas().style.cursor = 'pointer';
   });
 
-  // Mouse left the fill layer — clear everything
   map.on('mouseleave', FILL_LAYER_ID, () => {
     if (hoveredFeatureId !== null) {
       map.setFeatureState(featureStateRef(hoveredFeatureId), { hover: false });
@@ -237,7 +584,7 @@ function setupHoverHandlers() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Popup rendering
+// 6. Popup rendering
 // ---------------------------------------------------------------------------
 
 const popupEl      = document.getElementById('popup');
@@ -245,80 +592,75 @@ const popupAddress = document.getElementById('popup-address');
 const popupOwner   = document.getElementById('popup-owner');
 const popupSize    = document.getElementById('popup-size');
 
-/**
- * Display the popup near `point` with data from `properties`.
- * Field names differ between Regrid tiles and the SF demo GeoJSON,
- * so we use a series of fallbacks for each displayed value.
- */
 function showPopup(point, props) {
-  // --- Address ---
-  // Regrid: 'address' field  |  SF demo: individual components
+  // ---- Address / Identifier ----
+  // Regrid: 'address'
+  // IDWR:   parcel PIN + county (no address field in IDWR)
+  // SF demo: street components
   const address =
     props.address ||
     props.ADDRESS ||
     buildAddressFromParts(props) ||
-    props.blklot ||        // SF parcel block+lot ID as fallback label
+    (props.PIN ? `Parcel ${props.PIN}` : null) ||
+    props.blklot ||
     'Address unavailable';
 
-  // --- Owner ---
-  // Regrid provides this; most public demo datasets omit it for privacy
+  // ---- Owner ----
+  // Regrid: 'owner' field
+  // IDWR: OWNER field exists but is blank by Idaho law (Idaho Code 74-120)
   const owner =
-    props.owner ||
-    props.OWNER ||
-    props.OwnerName ||
+    props.owner      ||
+    props.OWNER      ||
+    props.OwnerName  ||
     props.owner_name ||
     null;
 
-  // --- Size (acreage) ---
-  // Regrid: 'll_gisacre'  |  Some county data: 'GIS_ACRES', 'Shape_Area', 'AREA'
-  const rawAcres =
-    props.ll_gisacre ||
-    props.GIS_ACRES  ||
-    props.ACRES      ||
-    props.Shape_Area ||   // Shape_Area is usually sq ft or sq meters — note below
+  // ---- Size ----
+  // Regrid:  'll_gisacre'
+  // IDWR:    'Shape__Area' (sq ft in native projection)
+  // SF demo: 'Shape_Area'
+  const rawArea =
+    props.ll_gisacre  ||
+    props.GIS_ACRES   ||
+    props.ACRES       ||
+    props.Shape__Area ||
+    props.Shape_Area  ||
     null;
 
-  let sizeText = 'Size unavailable';
-  if (rawAcres !== null) {
-    const n = parseFloat(rawAcres);
-    if (!isNaN(n)) {
-      // If the value is very large it's probably in sq ft (1 acre = 43,560 sq ft)
-      // or sq meters (1 acre = 4046.86 sq m). Heuristic: if > 1000 assume sq ft.
+  let sizeText = null;
+  if (rawArea !== null) {
+    const n = parseFloat(rawArea);
+    if (!isNaN(n) && n > 0) {
+      // IDWR Shape__Area is in sq ft (Idaho State Plane is foot-based).
+      // Heuristic: values > 1000 are almost certainly sq ft.
       const acres = n > 1000 ? n / 43560 : n;
       sizeText = `${acres.toFixed(4)} acres`;
     }
   }
 
+  // ---- County (IDWR specific) ----
+  const county = props.COUNTY ? `${props.COUNTY} County, ID` : null;
+
   popupAddress.textContent = address;
   popupOwner.textContent   = owner ? `Owner: ${owner}` : '';
 
-  // For the SF demo dataset, show neighborhood + zoning when no acreage is available
-  const neighborhood = props.analysis_neighborhood || null;
-  const zoning       = props.zoning_code || props.zoning_district || null;
-  const district     = props.supervisor_district ? `District ${props.supervisor_district}` : null;
-  const extraInfo    = [neighborhood, zoning, district].filter(Boolean).join(' · ');
-
-  if (rawAcres !== null) {
-    popupSize.textContent = `Size: ${sizeText}`;
-  } else if (extraInfo) {
-    popupSize.textContent = extraInfo;
+  if (sizeText) {
+    popupSize.textContent = `Size: ${sizeText}${county ? ` · ${county}` : ''}`;
+  } else if (county) {
+    popupSize.textContent = county;
   } else {
-    popupSize.textContent = 'Size unavailable';
+    // SF demo fallback: show neighborhood + zoning
+    const nb   = props.analysis_neighborhood || null;
+    const zone = props.zoning_code || props.zoning_district || null;
+    popupSize.textContent = [nb, zone].filter(Boolean).join(' · ') || 'Size unavailable';
   }
 
-  // Position popup offset from cursor so it doesn't cover what the user
-  // is hovering. Clamp to viewport so it doesn't go off-screen.
-  const offsetX = 18;
-  const offsetY = -12;
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
-
+  // Position popup near cursor, clamped to viewport
+  const offsetX = 18, offsetY = -12;
+  const popupW = 270, popupH = 85;
+  const vw = window.innerWidth, vh = window.innerHeight;
   let x = point.x + offsetX;
   let y = point.y + offsetY;
-
-  // Rough popup size estimate for clamping
-  const popupW = 260;
-  const popupH = 80;
   if (x + popupW > vw) x = point.x - popupW - offsetX;
   if (y + popupH > vh) y = vh - popupH - 10;
 
@@ -331,26 +673,19 @@ function hidePopup() {
   popupEl.classList.add('hidden');
 }
 
-/** Reconstruct an address string from street component fields (SF demo format) */
 function buildAddressFromParts(props) {
   const rawNum = props.from_address_num || props.from_addr || '';
-  // Skip address number if it is 0 (common placeholder in SF dataset)
   const num    = (String(rawNum).trim() === '0') ? '' : String(rawNum).trim();
   const street = String(props.street_name || props.str_name || '').trim();
   const type   = String(props.street_type || props.str_type || '').trim();
-
-  // Build "123 MAIN ST" style string
-  const streetParts = [num, street, type].filter(Boolean);
-  if (streetParts.length >= 2) return streetParts.join(' ');
-
-  // Fall back to neighborhood name if available
+  const parts  = [num, street, type].filter(Boolean);
+  if (parts.length >= 2) return parts.join(' ');
   if (props.analysis_neighborhood) return props.analysis_neighborhood;
-
   return null;
 }
 
 // ---------------------------------------------------------------------------
-// 6. UI helpers
+// 7. UI helpers
 // ---------------------------------------------------------------------------
 
 function updateDataModeBadge() {
@@ -359,7 +694,7 @@ function updateDataModeBadge() {
     badge.textContent = 'Live Parcels (Regrid)';
     badge.className   = 'badge badge-live';
   } else {
-    badge.textContent = 'Demo Mode (SF parcels)';
+    badge.textContent = 'Idaho Parcels (IDWR) + OSM Buildings';
     badge.className   = 'badge badge-demo';
   }
 }
@@ -368,10 +703,58 @@ function updateZoomHint() {
   const hint = document.getElementById('zoom-hint');
   if (!hint) return;
   const z = map.getZoom();
-  if (z >= PARCEL_MIN_ZOOM) {
-    hint.textContent = 'Hover over a property to see details';
+  if (z >= BUILDING_MIN_ZOOM) {
+    hint.textContent = 'Hover a parcel for details · Buildings shown';
+  } else if (z >= PARCEL_MIN_ZOOM) {
+    hint.textContent = 'Hover a property · Zoom in more for building shapes';
   } else {
     const needed = Math.ceil(PARCEL_MIN_ZOOM - z);
     hint.textContent = `Zoom in ${needed} more level${needed !== 1 ? 's' : ''} to see property lines`;
+  }
+}
+
+// Build the land-use color legend in the bottom-right panel
+function buildLegend() {
+  const legend = document.getElementById('legend');
+  if (!legend) return;
+
+  const entries = [
+    { color: '#4A9EFF', label: 'Residential' },
+    { color: '#FFD700', label: 'Commercial' },
+    { color: '#FF6B6B', label: 'Industrial' },
+    { color: '#4CAF50', label: 'Agricultural / Rural' },
+    { color: '#26C6DA', label: 'Public / Government' },
+    { color: '#888888', label: 'Vacant / Undeveloped' },
+    { color: '#AAAAAA', label: 'Unknown / No data' },
+    { color: '#E8A44A', label: 'Building footprint (OSM)' },
+  ];
+
+  legend.innerHTML = '<div class="legend-title">Property Type</div>' +
+    entries.map(e =>
+      `<div class="legend-row">` +
+      `<span class="legend-swatch" style="background:${e.color}"></span>` +
+      `<span class="legend-label">${e.label}</span>` +
+      `</div>`
+    ).join('');
+
+  if (!USE_REGRID) {
+    legend.innerHTML +=
+      '<div class="legend-note">Color coding requires Regrid API token. ' +
+      'Idaho parcels shown in grey (IDWR has no land-use field).</div>';
+  }
+}
+
+// Loading indicator — shows during async data fetches
+let loadingCount = 0;
+function setLoadingState(loading, msg = '') {
+  loadingCount += loading ? 1 : -1;
+  loadingCount = Math.max(0, loadingCount);
+  const el = document.getElementById('loading-indicator');
+  if (!el) return;
+  if (loadingCount > 0) {
+    el.textContent = msg;
+    el.classList.remove('hidden');
+  } else {
+    el.classList.add('hidden');
   }
 }
